@@ -1,4 +1,4 @@
-Bot de Trading Algorítmico — Binance Futures + Gemini AI
+🤖 Bot de Trading Algorítmico — Binance Futures + Gemini AI
 Resumen del proyecto
 Bot de scalping de reversión a la media para Binance Futures, escrito en Python 3. Capital inicial: $50 USD. Objetivo: escalar a $500. Usa 10x de apalancamiento con gestión de riesgo estricta.
 
