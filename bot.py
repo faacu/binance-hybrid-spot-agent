@@ -9,11 +9,12 @@ import os
 import time
 import logging
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
 import ccxt
-import google.generativeai as genai
+from google import genai
+from google.genai import types as ai_types
 from dotenv import load_dotenv
 from colorama import Fore, Style, init as colorama_init
 
@@ -37,15 +38,19 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-WATCHLIST = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT']
+WATCHLIST = ['BTC/USDT:USDT', 'SOL/USDT:USDT', 'PIPPIN/USDT:USDT']
 LEVERAGE = 10
-RISK_PER_TRADE = 0.02          # 2% of balance per trade
+RISK_PER_TRADE = 0.01          # 1% of balance per trade (reduced for volatile assets)
 KILL_SWITCH_THRESHOLD = 0.20   # Drop 20% → shut down
-TRAILING_STEP_PCT = 0.003      # 0.3% step to advance trailing SL
+TRAILING_STEP_PCT = 0.003      # 0.3% default trailing step
+# Per-symbol trailing step overrides for volatile assets that need more 'air'
+SYMBOL_TRAILING_OVERRIDES: dict[str, float] = {
+	'PIPPIN/USDT:USDT': 0.015,   # 1.5% — high volatility meme coin needs more air
+}
 OHLCV_TIMEFRAME = '5m'
 OHLCV_LIMIT = 100              # Number of candles sent to AI
 LOOP_INTERVAL_SECONDS = 60     # Main loop cadence
-GEMINI_MODEL = 'gemini-2.0-flash'  # gemini-3-flash does not exist yet
+GEMINI_MODEL = 'gemini-3-flash-preview'  # gemini-3-flash exist
 TESTNET_MODE = os.getenv('TESTNET_MODE', 'true').lower() == 'true'
 
 
@@ -60,6 +65,7 @@ class TrailingStop:
 	stop_price: float
 	highest_price: float        # Peak price reached since entry (long)
 	lowest_price: float         # Trough price reached since entry (short)
+	step_pct: float = TRAILING_STEP_PCT  # Effective step, may differ per symbol
 
 
 @dataclass
@@ -71,7 +77,7 @@ class Position:
 	size: float                 # Position size in contracts/base asset
 	order_id: str
 	trailing_stop: TrailingStop
-	opened_at: datetime = field(default_factory=datetime.utcnow)
+	opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
@@ -93,14 +99,29 @@ class ExchangeConnector:
 		self._exchange = ccxt.binanceusdm({
 			'apiKey': api_key,
 			'secret': api_secret,
-			'options': {'defaultType': 'future'},
+			'options': {
+				'defaultType': 'future',
+				'adjustForTimeDifference': True,
+			},
 		})
-		# Redirect all requests to Binance Futures Testnet when enabled
+
+		# Redirect all fapi endpoints to testnet without using the deprecated
+		# set_sandbox_mode(), which throws NotSupported since ccxt 4.x for futures.
 		if TESTNET_MODE:
-			self._exchange.set_sandbox_mode(True)
-			logger.warning('⚠️  TESTNET MODE ACTIVE — no real funds at risk')
+			testnet_host = 'https://testnet.binancefuture.com'
+			prod_host    = 'https://fapi.binance.com'
+			api_urls = self._exchange.urls.get('api', {})
+			for key, url in api_urls.items():
+				if key.startswith('fapi') and isinstance(url, str):
+					self._exchange.urls['api'][key] = url.replace(prod_host, testnet_host)
+			logger.warning('\u26a0\ufe0f  TESTNET MODE ACTIVE \u2014 testnet.binancefuture.com')
 		else:
-			logger.warning('🔴 LIVE MODE ACTIVE — real funds in use!')
+			logger.warning('\ud83d\udd34 LIVE MODE ACTIVE \u2014 real funds in use!')
+
+		# Prevent load_markets() from hitting the SAPI spot endpoint (fetch_currencies).
+		# binanceusdm inherits from binance and would call sapi/v1/capital/config/getall,
+		# which is a spot-only endpoint that rejects futures/testnet API keys.
+		self._exchange.has['fetchCurrencies'] = False
 		self._exchange.load_markets()
 
 	def set_leverage(self, symbol: str, leverage: int) -> None:
@@ -160,13 +181,13 @@ class ExchangeConnector:
 # ---------------------------------------------------------------------------
 class GeminiSignalAnalyzer:
 	"""
-	Uses Google Gemini Flash to analyse OHLCV data and produce a directional
-	signal for mean-reversion scalping.
+	Uses Google Gemini to analyse OHLCV data. 
+	Updated to use the modern google-genai SDK.
 	"""
 
 	def __init__(self, api_key: str):
-		genai.configure(api_key=api_key)
-		self._model = genai.GenerativeModel(GEMINI_MODEL)
+		self._client = genai.Client(api_key=api_key)
+		self._model_id = GEMINI_MODEL
 
 	def _build_prompt(self, symbol: str, candles: list[list]) -> str:
 		"""Builds the structured prompt sent to Gemini."""
@@ -201,23 +222,26 @@ Respond ONLY with a valid JSON object, no markdown, no commentary:
 		"""Calls Gemini and parses the trading signal."""
 		prompt = self._build_prompt(symbol, candles)
 		try:
-			response = self._model.generate_content(prompt)
+			response = self._client.models.generate_content(
+				model=self._model_id,
+				contents=prompt,
+				config=ai_types.GenerateContentConfig(
+					response_mime_type='application/json'
+				)
+			)
+			
 			raw_text = response.text.strip()
-			# Strip markdown fences if Gemini adds them anyway
-			if raw_text.startswith('```'):
-				raw_text = raw_text.split('```')[1]
-				if raw_text.startswith('json'):
-					raw_text = raw_text[4:]
 			parsed = json.loads(raw_text)
+			
 			return TradingSignal(
 				symbol=symbol,
-				action=parsed.get('action', 'hold'),
+				action=parsed.get('action', 'hold').lower(),
 				confidence=float(parsed.get('confidence', 0.0)),
 				reasoning=parsed.get('reasoning', ''),
 			)
 		except Exception as error:
-			logger.error('Gemini parse error for %s: %s', symbol, error)
-			return TradingSignal(symbol=symbol, action='hold', confidence=0.0, reasoning='parse error')
+			logger.error('Gemini API error for %s: %s', symbol, error)
+			return TradingSignal(symbol=symbol, action='hold', confidence=0.0, reasoning='API error')
 
 
 # ---------------------------------------------------------------------------
@@ -266,34 +290,37 @@ class RiskManager:
 		max_size = max_notional / entry_price
 		return min(raw_size, max_size)
 
-	def initialise_trailing_stop(self, side: str, entry_price: float) -> TrailingStop:
-		"""Creates the initial trailing stop at TRAILING_STEP_PCT from entry."""
-		if side == 'long':
-			stop_price = entry_price * (1 - TRAILING_STEP_PCT)
-		else:
-			stop_price = entry_price * (1 + TRAILING_STEP_PCT)
+	def initialise_trailing_stop(self, symbol: str, side: str, entry_price: float) -> TrailingStop:
+		"""
+		Creates the initial trailing stop. Volatile symbols defined in
+		SYMBOL_TRAILING_OVERRIDES get a wider step to survive price noise.
+		"""
+		step_pct = SYMBOL_TRAILING_OVERRIDES.get(symbol, TRAILING_STEP_PCT)
+		stop_price = entry_price * (1 - step_pct) if side == 'long' else entry_price * (1 + step_pct)
 		return TrailingStop(
 			entry_price=entry_price,
 			side=side,
 			stop_price=stop_price,
 			highest_price=entry_price,
 			lowest_price=entry_price,
+			step_pct=step_pct,
 		)
 
 	def update_trailing_stop(self, trailing: TrailingStop, current_price: float) -> TrailingStop:
 		"""
 		Advances the trailing stop when price moves in favour.
+		Uses the step_pct stored in the TrailingStop (may be a per-symbol override).
 		Never moves the stop against the position.
 		"""
 		if trailing.side == 'long':
 			if current_price > trailing.highest_price:
 				trailing.highest_price = current_price
-				new_stop = current_price * (1 - TRAILING_STEP_PCT)
+				new_stop = current_price * (1 - trailing.step_pct)
 				trailing.stop_price = max(trailing.stop_price, new_stop)
 		else:  # short
 			if current_price < trailing.lowest_price:
 				trailing.lowest_price = current_price
-				new_stop = current_price * (1 + TRAILING_STEP_PCT)
+				new_stop = current_price * (1 + trailing.step_pct)
 				trailing.stop_price = min(trailing.stop_price, new_stop)
 		return trailing
 
@@ -428,7 +455,7 @@ class TradingBot:
 		ticker = self._exchange.fetch_ticker(signal.symbol)
 		entry_price = float(ticker['last'])
 
-		trailing = self._risk.initialise_trailing_stop(signal.action, entry_price)
+		trailing = self._risk.initialise_trailing_stop(signal.symbol, signal.action, entry_price)
 		raw_size = self._risk.calculate_position_size(balance, entry_price, trailing.stop_price)
 
 		# Round to exchange precision BEFORE validation — a raw float like
