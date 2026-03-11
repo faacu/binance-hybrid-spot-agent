@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-WATCHLIST = ['BTC/USDT:USDT', 'PAXG/USDT:USDT', 'OIL/USDT:USDT']
+WATCHLIST = ['BTC/USDT:USDT', 'PAXG/USDT:USDT', 'SOL/USDT:USDT']
 LEVERAGE = 3
 RISK_PER_TRADE = 0.01          # 1% of balance per trade (reduced for volatile assets)
 KILL_SWITCH_THRESHOLD = 0.20   # Drop 20% → shut down
@@ -49,7 +49,8 @@ SYMBOL_TRAILING_OVERRIDES: dict[str, float] = {
 }
 OHLCV_TIMEFRAME = '1h'
 OHLCV_LIMIT = 100              # Number of candles sent to AI
-LOOP_INTERVAL_SECONDS = 900    # Main loop cadence
+POSITION_MONITOR_INTERVAL_SECONDS = 30  # Fast loop cadence for trailing stops
+SCAN_INTERVAL_SECONDS = 900    # Slow loop cadence for Gemini AI scans
 GEMINI_MODEL = 'gemini-3-flash-preview'
 TESTNET_MODE = os.getenv('TESTNET_MODE', 'true').lower() == 'true'
 
@@ -442,6 +443,8 @@ class TradingBot:
 		# Set leverage for all symbols at startup
 		for symbol in WATCHLIST:
 			self._exchange.set_leverage(symbol, LEVERAGE)
+			
+		self._last_scan_time = 0.0  # Force scan on first tick
 
 	# ------------------------------------------------------------------
 	# Trade lifecycle helpers
@@ -509,11 +512,9 @@ class TradingBot:
 				current_price, position.trailing_stop.stop_price,
 			)
 
-	def _process_symbol(self, symbol: str, balance: float) -> None:
-		"""Full decision cycle for a single symbol."""
+	def _scan_for_signals(self, symbol: str, balance: float) -> None:
+		"""Asks AI for a signal if no open position exists."""
 		if self._positions.has_position(symbol):
-			position = self._positions.get_position(symbol)
-			self._manage_existing_position(position)
 			return
 
 		# No open position — ask AI for a signal
@@ -540,9 +541,7 @@ class TradingBot:
 		while True:
 			try:
 				balance = self._exchange.fetch_balance()
-				logger.info('Current balance: $%.2f USDT', balance)
-				self._reporter.print_balance(balance)
-
+				
 				if self._risk.check_kill_switch(balance):
 					drawdown = (self._risk._initial_balance - balance) / self._risk._initial_balance
 					self._reporter.print_kill_switch(balance, self._risk._initial_balance, drawdown)
@@ -554,20 +553,38 @@ class TradingBot:
 					logger.critical('All positions closed. Bot is halting.')
 					break
 
-				self._reporter.scan_start()
-				for symbol in WATCHLIST:
-					self._reporter.scan_symbol(symbol)
-					self._process_symbol(symbol, balance)
-				self._reporter.scan_done()
+				current_time = time.time()
+				is_scan_time = (current_time - self._last_scan_time) >= SCAN_INTERVAL_SECONDS
+
+				# 1. Fast Loop: Monitor open positions and trailing stops
+				open_symbols = self._positions.all_symbols()
+				if open_symbols:
+					for symbol in open_symbols:
+						position = self._positions.get_position(symbol)
+						if position:
+							self._manage_existing_position(position)
+
+				# 2. Slow Loop: Scan for new entries via Gemini AI
+				if is_scan_time:
+					logger.info('Current balance: $%.2f USDT', balance)
+					self._reporter.print_balance(balance)
+					self._reporter.scan_start()
+					for symbol in WATCHLIST:
+						# Only scan symbols that don't have an active position
+						if not self._positions.has_position(symbol):
+							self._reporter.scan_symbol(symbol)
+							self._scan_for_signals(symbol, balance)
+					self._reporter.scan_done()
+					self._last_scan_time = time.time()
 
 			except ccxt.NetworkError as error:
-				logger.error('Network error: %s — retrying in %ds', error, LOOP_INTERVAL_SECONDS)
+				logger.error('Network error: %s — retrying in %ds', error, POSITION_MONITOR_INTERVAL_SECONDS)
 			except ccxt.ExchangeError as error:
 				logger.error('Exchange error: %s', error)
 			except Exception as error:
 				logger.exception('Unexpected error: %s', error)
 
-			time.sleep(LOOP_INTERVAL_SECONDS)
+			time.sleep(POSITION_MONITOR_INTERVAL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
