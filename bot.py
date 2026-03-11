@@ -38,19 +38,19 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-WATCHLIST = ['BTC/USDT:USDT', 'SOL/USDT:USDT', 'PIPPIN/USDT:USDT']
-LEVERAGE = 10
+WATCHLIST = ['BTC/USDT:USDT', 'PAXG/USDT:USDT', 'OIL/USDT:USDT']
+LEVERAGE = 3
 RISK_PER_TRADE = 0.01          # 1% of balance per trade (reduced for volatile assets)
 KILL_SWITCH_THRESHOLD = 0.20   # Drop 20% → shut down
-TRAILING_STEP_PCT = 0.003      # 0.3% default trailing step
+TRAILING_STEP_PCT = 0.015      # 1.5% default trailing step
 # Per-symbol trailing step overrides for volatile assets that need more 'air'
 SYMBOL_TRAILING_OVERRIDES: dict[str, float] = {
 	'PIPPIN/USDT:USDT': 0.015,   # 1.5% — high volatility meme coin needs more air
 }
-OHLCV_TIMEFRAME = '5m'
+OHLCV_TIMEFRAME = '1h'
 OHLCV_LIMIT = 100              # Number of candles sent to AI
-LOOP_INTERVAL_SECONDS = 60     # Main loop cadence
-GEMINI_MODEL = 'gemini-3-flash-preview'  # gemini-3-flash exist
+LOOP_INTERVAL_SECONDS = 900    # Main loop cadence
+GEMINI_MODEL = 'gemini-3-flash-preview'
 TESTNET_MODE = os.getenv('TESTNET_MODE', 'true').lower() == 'true'
 
 
@@ -196,19 +196,16 @@ class GeminiSignalAnalyzer:
 			for c in candles[-30:]   # Last 30 candles are enough context
 		)
 		return f"""
-You are an expert quantitative trader specialising in crypto futures scalping.
-Analyse the following {OHLCV_TIMEFRAME} OHLCV data for {symbol} and detect a
-mean-reversion opportunity (price stretched far from its short-term mean).
+Actúa como un gestor de fondos Macro. Analiza estas velas de {OHLCV_TIMEFRAME} para {symbol} considerando el contexto de tensión geopolítica actual (EE. UU. - Irán). Busca agotamiento en las tendencias y niveles de soporte/resistencia fuertes. No operes si el mercado está esperando una noticia de alto impacto (volatilidad plana). Prioriza entradas donde el riesgo/beneficio sea de al menos 1:3.
 
 Candles (timestamp, open, high, low, close, volume):
 {candle_rows}
 
 Rules:
-- A BUY signal means price is oversold vs the short-term mean and likely to snap back up.
-- A SELL signal means price is overbought vs the short-term mean and likely to snap back down.
-- A HOLD signal means no clear opportunity.
-- If the market is in a sideways range with low volume, the action MUST be hold, regardless
-  of any other indicators. Priority is capital preservation over trade frequency.
+- A BUY signal means price is at a strong support level or trend exhaustion, with a favorable risk/reward.
+- A SELL signal means price is at a strong resistance level or trend exhaustion, with a favorable risk/reward.
+- A HOLD signal means no clear opportunity, or market is waiting for high impact news (flat volatility).
+- Priority is capital preservation over trade frequency.
 
 Respond ONLY with a valid JSON object, no markdown, no commentary:
 {{
