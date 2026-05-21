@@ -7,6 +7,7 @@ Wallet:    PaperWallet — fully simulated, no real orders placed.
 
 import os
 import re
+import sys
 import html
 import time
 import logging
@@ -21,6 +22,11 @@ from google import genai
 from google.genai import types as ai_types
 from dotenv import load_dotenv
 from colorama import Fore, Style, init as colorama_init
+
+# Configure output streams to use UTF-8 to support emojis on Windows terminal
+if sys.platform.startswith('win'):
+	sys.stdout.reconfigure(encoding='utf-8')
+	sys.stderr.reconfigure(encoding='utf-8')
 
 colorama_init(autoreset=True)
 load_dotenv()
@@ -43,7 +49,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 WATCHLIST: list[str] = ['BTC/USDT', 'SOL/USDT', 'ETH/USDT']
 
-GEMINI_MODEL         = 'gemini-2.5-flash-preview-04-17'
+GEMINI_MODEL         = 'gemini-2.5-flash'
 CANDLE_TIMEFRAME     = '15m'       # OHLCV timeframe fed to indicators
 CANDLE_LIMIT         = 50          # Number of candles to fetch
 SMA_SHORT            = 10          # Short SMA period
