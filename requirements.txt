@@ -4,3 +4,4 @@ colorama>=0.4.6
 feedparser>=6.0.0
 ccxt>=4.0.0
 numpy>=1.26.0
+twilio>=9.0.0

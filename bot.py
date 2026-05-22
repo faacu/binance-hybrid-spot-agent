@@ -467,37 +467,53 @@ Respond ONLY with a valid JSON object — no markdown, no commentary:
 }}
 """
 
+	def _call_gemini(self, prompt: str) -> dict:
+		"""Executes a single Gemini API call and returns the parsed JSON dict."""
+		response = self._client.models.generate_content(
+			model=self._model_id,
+			contents=prompt,
+			config=ai_types.GenerateContentConfig(
+				response_mime_type='application/json'
+			),
+		)
+		return json.loads(response.text.strip())
+
 	def analyse(self, snapshot: TechnicalSnapshot) -> TradeSignal:
-		"""Calls Gemini and parses the hybrid trade signal."""
+		"""
+		Calls Gemini and parses the hybrid trade signal.
+		Retries once after 10s on transient errors (503, network failures).
+		"""
 		prompt = self._build_prompt(snapshot)
-		try:
-			response = self._client.models.generate_content(
-				model=self._model_id,
-				contents=prompt,
-				config=ai_types.GenerateContentConfig(
-					response_mime_type='application/json'
-				),
-			)
 
-			parsed = json.loads(response.text.strip())
-
-			return TradeSignal(
-				symbol=snapshot.symbol,
-				action=parsed.get('action', 'HOLD').upper(),
-				confidence=float(parsed.get('confidence', 0.0)),
-				allocation_pct=float(parsed.get('allocation_pct', 0.0)),
-				reasoning=parsed.get('reasoning', ''),
-			)
-
-		except Exception as error:
-			logger.error('Gemini API error for %s: %s', snapshot.symbol, error)
-			return TradeSignal(
-				symbol=snapshot.symbol,
-				action='HOLD',
-				confidence=0.0,
-				allocation_pct=0.0,
-				reasoning=f'API error — defaulting to HOLD ({error})',
-			)
+		for attempt in range(1, 3):  # attempts: 1, 2
+			try:
+				parsed = self._call_gemini(prompt)
+				return TradeSignal(
+					symbol=snapshot.symbol,
+					action=parsed.get('action', 'HOLD').upper(),
+					confidence=float(parsed.get('confidence', 0.0)),
+					allocation_pct=float(parsed.get('allocation_pct', 0.0)),
+					reasoning=parsed.get('reasoning', ''),
+				)
+			except Exception as error:
+				if attempt < 2:
+					logger.warning(
+						'Gemini API error for %s (attempt %d/2) — retrying in 10s: %s',
+						snapshot.symbol, attempt, error,
+					)
+					time.sleep(10)
+				else:
+					logger.error(
+						'Gemini API error for %s (attempt %d/2) — giving up: %s',
+						snapshot.symbol, attempt, error,
+					)
+					return TradeSignal(
+						symbol=snapshot.symbol,
+						action='HOLD',
+						confidence=0.0,
+						allocation_pct=0.0,
+						reasoning=f'API error — defaulting to HOLD ({error})',
+					)
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +573,69 @@ class ConsoleReporter:
 
 
 # ---------------------------------------------------------------------------
+# WhatsApp Notifier — Twilio
+# ---------------------------------------------------------------------------
+class WhatsAppNotifier:
+	"""
+	Sends WhatsApp trade alerts via the Twilio API.
+	All credentials are loaded from environment variables.
+	Fails silently to avoid crashing the main bot loop.
+	"""
+
+	def __init__(self):
+		self._account_sid = os.getenv('TWILIO_ACCOUNT_SID', '')
+		self._auth_token  = os.getenv('TWILIO_AUTH_TOKEN', '')
+		self._from_number = os.getenv('TWILIO_WHATSAPP_FROM', '')  # e.g. whatsapp:+14155238886
+		self._to_number   = os.getenv('TWILIO_WHATSAPP_TO', '')    # e.g. whatsapp:+5491112345678
+
+		self._enabled = all([
+			self._account_sid,
+			self._auth_token,
+			self._from_number,
+			self._to_number,
+		])
+
+		if not self._enabled:
+			logger.warning('WhatsAppNotifier: missing credentials — notifications disabled.')
+
+	def send_trade_alert(self, tx: Transaction, current_balance: float) -> None:
+		"""
+		Formats and sends a WhatsApp trade alert.
+		Never raises — errors are logged and silently swallowed.
+		"""
+		if not self._enabled:
+			return
+
+		side_emoji = '🟢 BUY' if tx.side == 'BUY' else '🔴 SELL'
+		usdt_label = 'Spent' if tx.side == 'BUY' else 'Received'
+
+		message = (
+			f'📊 *Paper Trade Executed*\n'
+			f'━━━━━━━━━━━━━━━━━━━━━\n'
+			f'• Side    : {side_emoji}\n'
+			f'• Symbol  : {tx.symbol}\n'
+			f'• Price   : ${tx.price:,.4f} USDT\n'
+			f'• {usdt_label:<8}: ${tx.amount_usdt:,.2f} USDT\n'
+			f'• Amount  : {tx.amount_crypto:.6f} {tx.symbol.split("/")[0]}\n'
+			f'━━━━━━━━━━━━━━━━━━━━━\n'
+			f'💼 Balance : ${current_balance:,.2f} USDT\n'
+			f'🕒 {tx.timestamp.strftime("%Y-%m-%d %H:%M UTC")}'
+		)
+
+		try:
+			from twilio.rest import Client as TwilioClient
+			client = TwilioClient(self._account_sid, self._auth_token)
+			client.messages.create(
+				body=message,
+				from_=self._from_number,
+				to=self._to_number,
+			)
+			logger.info('WhatsAppNotifier: alert sent for %s %s.', tx.side, tx.symbol)
+		except Exception as error:
+			logger.error('WhatsAppNotifier.send_trade_alert failed: %s', error)
+
+
+# ---------------------------------------------------------------------------
 # Core bot orchestrator
 # ---------------------------------------------------------------------------
 class SpotPaperTradingBot:
@@ -574,12 +653,13 @@ class SpotPaperTradingBot:
 		initial_balance = float(os.getenv('INITIAL_PAPER_BALANCE', '1000.0'))
 		gemini_api_key  = os.getenv('GEMINI_API_KEY', '')
 
-		self._wallet    = PaperWallet(initial_balance)
-		self._market    = MarketDataProvider()
+		self._wallet     = PaperWallet(initial_balance)
+		self._market     = MarketDataProvider()
 		self._indicators = IndicatorEngine()
-		self._ai        = GeminiSignalAnalyzer(api_key=gemini_api_key)
-		self._reporter  = ConsoleReporter()
-		self._cycle     = 0
+		self._ai         = GeminiSignalAnalyzer(api_key=gemini_api_key)
+		self._reporter   = ConsoleReporter()
+		self._notifier   = WhatsAppNotifier()
+		self._cycle      = 0
 
 	# ------------------------------------------------------------------
 	# Snapshot builder
@@ -636,6 +716,7 @@ class SpotPaperTradingBot:
 
 		if tx:
 			self._reporter.print_trade_executed(tx)
+			self._notifier.send_trade_alert(tx, self._wallet.usdt_balance)
 
 	# ------------------------------------------------------------------
 	# Per-symbol pipeline
@@ -686,6 +767,7 @@ class SpotPaperTradingBot:
 				print(f'\n{Fore.CYAN}  📡  ANALYZING MARKETS ...{Style.RESET_ALL}')
 				for symbol in WATCHLIST:
 					self._process_symbol(symbol, news)
+					time.sleep(15)  # Throttle burst requests to avoid Gemini 429 rate-limit
 
 				self._reporter.print_footer()
 
