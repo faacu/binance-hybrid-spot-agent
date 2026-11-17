@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-WATCHLIST: list[str] = ['BTC/USDT', 'SOL/USDT', 'ETH/USDT']
+WATCHLIST: list[str] = ['SOL/USDT'] # 'BTC/USDT', 'SOL/USDT', 'ETH/USDT'
 
 GEMINI_MODEL         = 'gemini-2.5-flash'
 CANDLE_TIMEFRAME     = '15m'       # OHLCV timeframe fed to indicators
